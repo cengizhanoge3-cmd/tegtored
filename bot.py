@@ -21,8 +21,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 import uvicorn
 
-# Database (NeonDB)
-import asyncpg
+# Database (NeonDB) - Optional
+try:
+    import asyncpg
+    ASYNCPG_AVAILABLE = True
+except ImportError:
+    ASYNCPG_AVAILABLE = False
+    logger.warning("asyncpg not available, using file storage only")
 
 # Environment variables
 from dotenv import load_dotenv
