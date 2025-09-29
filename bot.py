@@ -71,8 +71,8 @@ _POSTED_IDS_TABLE_SQL = (
     ")"
 )
 
-def _db_connect():
-    """Get a psycopg2 connection using DATABASE_URL."""
+async def _db_connect():
+    """Get an asyncpg connection using DATABASE_URL."""
     try:
         dsn = DATABASE_URL
         if not dsn:
@@ -83,74 +83,70 @@ def _db_connect():
             dsn = dsn[13:]
         dsn = dsn.strip('\'"')
         
-        conn = psycopg2.connect(dsn)
+        conn = await asyncpg.connect(dsn)
         return conn
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         raise
 
-def _ensure_posted_ids_table():
+async def _ensure_posted_ids_table():
     """Ensure posted_reddit_ids table exists."""
-    conn = _db_connect()
+    conn = await _db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(_POSTED_IDS_TABLE_SQL)
-        conn.commit()
+        await conn.execute(_POSTED_IDS_TABLE_SQL)
     finally:
-        conn.close()
+        await conn.close()
 
-def _db_load_posted_ids():
+async def _db_load_posted_ids():
     """Load all posted Reddit IDs from database."""
-    conn = _db_connect()
+    conn = await _db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM posted_reddit_ids ORDER BY created_at DESC")
-            rows = cur.fetchall()
-            return [row[0] for row in rows]
+        rows = await conn.fetch("SELECT id FROM posted_reddit_ids ORDER BY created_at DESC")
+        return [row['id'] for row in rows]
     finally:
-        conn.close()
+        await conn.close()
 
-def _db_save_posted_id(post_id: str):
+async def _db_save_posted_id(post_id: str):
     """Save a posted Reddit ID to database."""
-    conn = _db_connect()
+    conn = await _db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO posted_reddit_ids (id) VALUES (%s) ON CONFLICT (id) DO NOTHING",
-                (post_id,)
-            )
-        conn.commit()
+        await conn.execute(
+            "INSERT INTO posted_reddit_ids (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+            post_id
+        )
     finally:
-        conn.close()
+        await conn.close()
 
-def _db_prune_posted_ids_keep_latest(limit: int = 10):
+async def _db_prune_posted_ids_keep_latest(limit: int = 10):
     """Keep only the latest 'limit' records in posted_reddit_ids table."""
-    conn = _db_connect()
+    conn = await _db_connect()
     try:
-        with conn.cursor() as cur:
-            # Delete all but the most recent 'limit' records
-            cur.execute("""
-                DELETE FROM posted_reddit_ids 
-                WHERE id NOT IN (
-                    SELECT id FROM posted_reddit_ids 
-                    ORDER BY created_at DESC 
-                    LIMIT %s
-                )
-            """, (limit,))
-        conn.commit()
+        # Delete all but the most recent 'limit' records
+        await conn.execute("""
+            DELETE FROM posted_reddit_ids 
+            WHERE id NOT IN (
+                SELECT id FROM posted_reddit_ids 
+                ORDER BY created_at DESC 
+                LIMIT $1
+            )
+        """, limit)
         logger.info(f"Database pruned, keeping latest {limit} records")
     finally:
-        conn.close()
+        await conn.close()
 
 class RedditToTelegramBot:
     def __init__(self):
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.reddit = None
-        self.processed_posts = self.load_processed_posts()
+        self.processed_posts = set()  # Will be loaded async
         self.running = False
         
         # Initialize Reddit client
         self.init_reddit()
+    
+    async def initialize_async(self):
+        """Initialize async components"""
+        self.processed_posts = await self.load_processed_posts()
         
     def init_reddit(self):
         """Initialize Reddit client"""
@@ -171,13 +167,13 @@ class RedditToTelegramBot:
             logger.error(f"Failed to initialize Reddit client: {e}")
             raise
     
-    def load_processed_posts(self) -> set:
+    async def load_processed_posts(self) -> set:
         """Load processed post IDs from database or file fallback"""
         # 1) Try database first
         if USE_DB_FOR_POSTED_IDS:
             try:
-                _ensure_posted_ids_table()
-                ids = _db_load_posted_ids()
+                await _ensure_posted_ids_table()
+                ids = await _db_load_posted_ids()
                 logger.info(f"Loaded {len(ids)} processed post IDs from database")
                 return set(ids)
             except Exception as e:
@@ -197,15 +193,15 @@ class RedditToTelegramBot:
             logger.error(f"Error loading processed posts from file: {e}")
         return set()
     
-    def save_processed_post(self, post_id: str):
+    async def save_processed_post(self, post_id: str):
         """Save a single processed post ID to database or file"""
         # 1) Try database first
         if USE_DB_FOR_POSTED_IDS:
             try:
-                _ensure_posted_ids_table()
-                _db_save_posted_id(post_id)
+                await _ensure_posted_ids_table()
+                await _db_save_posted_id(post_id)
                 # Prune old records, keep only latest 10
-                _db_prune_posted_ids_keep_latest(POSTED_IDS_RETENTION)
+                await _db_prune_posted_ids_keep_latest(POSTED_IDS_RETENTION)
                 logger.info(f"Saved post ID to database: {post_id}")
                 return
             except Exception as e:
@@ -435,7 +431,7 @@ class RedditToTelegramBot:
                     
                     if success:
                         # Mark as processed (save to database/file)
-                        self.save_processed_post(submission.id)
+                        await self.save_processed_post(submission.id)
                         # Also add to memory set for current session
                         self.processed_posts.add(submission.id)
                         logger.info(f"Processed post: {submission.id} - {submission.title[:50]}...")
@@ -455,6 +451,10 @@ class RedditToTelegramBot:
     async def run_bot_loop(self):
         """Main bot loop"""
         logger.info("Starting Reddit to Telegram bot...")
+        
+        # Initialize async components
+        await self.initialize_async()
+        
         self.running = True
         
         while self.running:
@@ -507,13 +507,10 @@ async def get_stats():
     db_stats = {}
     if USE_DB_FOR_POSTED_IDS:
         try:
-            conn = _db_connect()
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM posted_reddit_ids")
-                db_count = cur.fetchone()[0]
-                cur.execute("SELECT MAX(created_at) FROM posted_reddit_ids")
-                last_post = cur.fetchone()[0]
-            conn.close()
+            conn = await _db_connect()
+            db_count = await conn.fetchval("SELECT COUNT(*) FROM posted_reddit_ids")
+            last_post = await conn.fetchval("SELECT MAX(created_at) FROM posted_reddit_ids")
+            await conn.close()
             db_stats = {
                 "database_posts_count": db_count,
                 "last_post_time": str(last_post) if last_post else None,
@@ -542,17 +539,15 @@ async def test_database():
         return {"error": "No DATABASE_URL configured"}
     
     try:
-        _ensure_posted_ids_table()
-        conn = _db_connect()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, created_at 
-                FROM posted_reddit_ids 
-                ORDER BY created_at DESC 
-                LIMIT 10
-            """)
-            rows = cur.fetchall()
-        conn.close()
+        await _ensure_posted_ids_table()
+        conn = await _db_connect()
+        rows = await conn.fetch("""
+            SELECT id, created_at 
+            FROM posted_reddit_ids 
+            ORDER BY created_at DESC 
+            LIMIT 10
+        """)
+        await conn.close()
         
         return {
             "status": "success",
@@ -608,7 +603,15 @@ def main():
     # Test database connection if DATABASE_URL is provided
     if DATABASE_URL:
         try:
-            _ensure_posted_ids_table()
+            # Test database connection in async context
+            async def test_db():
+                await _ensure_posted_ids_table()
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(test_db())
+            loop.close()
+            
             logger.info("✅ Database connection successful")
         except Exception as e:
             logger.error(f"❌ Database connection failed: {e}")
