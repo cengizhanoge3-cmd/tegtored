@@ -22,8 +22,7 @@ from fastapi.responses import PlainTextResponse
 import uvicorn
 
 # Database (NeonDB)
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg
 
 # Environment variables
 from dotenv import load_dotenv
