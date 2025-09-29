@@ -21,14 +21,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 import uvicorn
 
-# Database (NeonDB) - Optional
-try:
-    import asyncpg
-    ASYNCPG_AVAILABLE = True
-except ImportError:
-    ASYNCPG_AVAILABLE = False
-    logger.warning("asyncpg not available, using file storage only")
-
 # Environment variables
 from dotenv import load_dotenv
 
@@ -41,6 +33,14 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Database (NeonDB) - Optional
+try:
+    import asyncpg
+    ASYNCPG_AVAILABLE = True
+except ImportError:
+    ASYNCPG_AVAILABLE = False
+    logger.warning("asyncpg not available, using file storage only")
 
 # Configuration
 TELEGRAM_BOT_TOKEN = "8343304363:AAH20G_levf2X_w0AhZq4Lz3ORNV-WSmlm4"
@@ -55,8 +55,8 @@ REDDIT_USER_AGENT = "python:bf6-telegram-bot:v1.0.0 (by /u/BFHaber_Bot)"
 
 # Database configuration (NeonDB)
 DATABASE_URL = os.getenv("DATABASE_URL")
-USE_DB_FOR_POSTED_IDS = bool(DATABASE_URL)
-FAIL_IF_DB_UNAVAILABLE = os.getenv("FAIL_IF_DB_UNAVAILABLE", "true").lower() == "true"
+USE_DB_FOR_POSTED_IDS = bool(DATABASE_URL) and ASYNCPG_AVAILABLE
+FAIL_IF_DB_UNAVAILABLE = os.getenv("FAIL_IF_DB_UNAVAILABLE", "false").lower() == "true"  # Default false for compatibility
 
 # Bot settings
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # 5 minutes default
@@ -78,6 +78,9 @@ _POSTED_IDS_TABLE_SQL = (
 
 async def _db_connect():
     """Get an asyncpg connection using DATABASE_URL."""
+    if not ASYNCPG_AVAILABLE:
+        raise ImportError("asyncpg not available")
+    
     try:
         dsn = DATABASE_URL
         if not dsn:
