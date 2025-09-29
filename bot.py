@@ -231,59 +231,151 @@ class RedditToTelegramBot:
         except Exception as e:
             logger.error(f"Error saving processed post to file: {e}")
     
-    def format_post_for_telegram(self, submission: Submission) -> str:
-        """Format Reddit post for Telegram"""
+    def get_bot_comment_continuation(self, submission: Submission) -> str:
+        """Get BFHaber_Bot's comment if post text is truncated"""
+        try:
+            # Refresh submission to get comments
+            submission.comments.replace_more(limit=0)
+            
+            for comment in submission.comments:
+                if (comment.author and 
+                    comment.author.name.lower() == TARGET_USER.lower() and
+                    len(comment.body.strip()) > 10):  # Meaningful comment
+                    return comment.body.strip()
+            return ""
+        except Exception as e:
+            logger.warning(f"Error getting bot comment: {e}")
+            return ""
+    
+    def format_post_for_telegram(self, submission: Submission) -> tuple[str, list]:
+        """Format Reddit post for Telegram. Returns (message, media_urls)"""
         title = submission.title
-        url = f"https://reddit.com{submission.permalink}"
-        author = submission.author.name if submission.author else "Unknown"
-        created_time = datetime.fromtimestamp(submission.created_utc)
         
-        # Format message
+        # Start with just the title
         message = f"🎮 **{title}**\n\n"
         
+        # Get post content
+        content = ""
         if submission.selftext and len(submission.selftext.strip()) > 0:
-            # Limit selftext to avoid Telegram message limits
-            selftext = submission.selftext[:500]
-            if len(submission.selftext) > 500:
-                selftext += "..."
-            message += f"{selftext}\n\n"
+            content = submission.selftext.strip()
+            
+            # Check if text is truncated (ends with ...)
+            if content.endswith("...") or len(content) > 800:
+                # Try to get continuation from bot's comment
+                bot_comment = self.get_bot_comment_continuation(submission)
+                if bot_comment:
+                    # Remove the "..." and add the comment
+                    if content.endswith("..."):
+                        content = content[:-3].strip()
+                    content += f"\n\n{bot_comment}"
+            
+            message += f"{content}\n\n"
         
-        message += f"👤 **Yazar:** u/{author}\n"
-        message += f"🕒 **Tarih:** {created_time.strftime('%d.%m.%Y %H:%M')}\n"
-        message += f"🔗 **Link:** {url}\n"
+        # Get media URLs
+        media_urls = []
         
-        # Add subreddit info
-        message += f"📍 **Subreddit:** r/{submission.subreddit.display_name}"
+        # Check for images/videos in post
+        if hasattr(submission, 'url') and submission.url:
+            url = submission.url.lower()
+            # Image formats
+            if any(url.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                media_urls.append(submission.url)
+            # Video formats  
+            elif any(url.endswith(ext) for ext in ['.mp4', '.webm', '.mov']):
+                media_urls.append(submission.url)
+            # Reddit video
+            elif 'v.redd.it' in url:
+                media_urls.append(submission.url)
+            # Reddit gallery
+            elif hasattr(submission, 'is_gallery') and submission.is_gallery:
+                if hasattr(submission, 'media_metadata'):
+                    for item_id in submission.media_metadata:
+                        item = submission.media_metadata[item_id]
+                        if 's' in item and 'u' in item['s']:
+                            # Convert preview URL to full resolution
+                            img_url = item['s']['u'].replace('preview.redd.it', 'i.redd.it')
+                            img_url = img_url.split('?')[0]  # Remove query parameters
+                            media_urls.append(img_url)
         
-        return message
+        # Add source link at the end (smaller, less prominent)
+        message += f"🔗 [Kaynak]({submission.url})"
+        
+        return message, media_urls
     
-    async def send_to_telegram(self, message: str, post_url: str = None):
-        """Send message to Telegram"""
+    async def send_to_telegram(self, message: str, media_urls: list = None):
+        """Send message with media to Telegram"""
         try:
             if not TELEGRAM_CHAT_ID:
                 logger.warning("TELEGRAM_CHAT_ID not set, cannot send message")
                 return False
+            
+            # Send media first if available
+            if media_urls:
+                for media_url in media_urls[:10]:  # Limit to 10 media items
+                    try:
+                        # Determine media type
+                        url_lower = media_url.lower()
+                        
+                        if any(url_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                            # Send as photo
+                            await self.telegram_bot.send_photo(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                photo=media_url,
+                                caption=message if len(media_urls) == 1 else None,
+                                parse_mode='Markdown'
+                            )
+                        elif any(url_lower.endswith(ext) for ext in ['.mp4', '.webm', '.mov']) or 'v.redd.it' in url_lower:
+                            # Send as video
+                            await self.telegram_bot.send_video(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                video=media_url,
+                                caption=message if len(media_urls) == 1 else None,
+                                parse_mode='Markdown'
+                            )
+                        else:
+                            # Send as document for other formats
+                            await self.telegram_bot.send_document(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                document=media_url,
+                                caption=message if len(media_urls) == 1 else None,
+                                parse_mode='Markdown'
+                            )
+                        
+                        await asyncio.sleep(1)  # Rate limiting between media
+                        
+                    except Exception as media_error:
+                        logger.warning(f"Failed to send media {media_url}: {media_error}")
+                        continue
                 
-            # Split long messages if needed
-            max_length = 4096
-            if len(message) > max_length:
-                # Send in chunks
-                for i in range(0, len(message), max_length):
-                    chunk = message[i:i + max_length]
+                # If multiple media items, send text separately
+                if len(media_urls) > 1:
                     await self.telegram_bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=chunk,
+                        text=message,
                         parse_mode='Markdown',
-                        disable_web_page_preview=False
+                        disable_web_page_preview=True
                     )
-                    await asyncio.sleep(1)  # Rate limiting
             else:
-                await self.telegram_bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode='Markdown',
-                    disable_web_page_preview=False
-                )
+                # No media, send text only
+                max_length = 4096
+                if len(message) > max_length:
+                    # Send in chunks
+                    for i in range(0, len(message), max_length):
+                        chunk = message[i:i + max_length]
+                        await self.telegram_bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=chunk,
+                            parse_mode='Markdown',
+                            disable_web_page_preview=True
+                        )
+                        await asyncio.sleep(1)  # Rate limiting
+                else:
+                    await self.telegram_bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=message,
+                        parse_mode='Markdown',
+                        disable_web_page_preview=True
+                    )
             
             logger.info("Message sent to Telegram successfully")
             return True
@@ -336,14 +428,11 @@ class RedditToTelegramBot:
             
             for submission in new_posts:
                 try:
-                    # Format message
-                    message = self.format_post_for_telegram(submission)
+                    # Format message and get media URLs
+                    message, media_urls = self.format_post_for_telegram(submission)
                     
-                    # Send to Telegram
-                    success = await self.send_to_telegram(
-                        message, 
-                        f"https://reddit.com{submission.permalink}"
-                    )
+                    # Send to Telegram with media
+                    success = await self.send_to_telegram(message, media_urls)
                     
                     if success:
                         # Mark as processed (save to database/file)
@@ -415,13 +504,71 @@ async def get_stats():
     if not bot_instance:
         return {"error": "Bot not initialized"}
     
+    # Get database stats if available
+    db_stats = {}
+    if USE_DB_FOR_POSTED_IDS:
+        try:
+            conn = _db_connect()
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM posted_reddit_ids")
+                db_count = cur.fetchone()[0]
+                cur.execute("SELECT MAX(created_at) FROM posted_reddit_ids")
+                last_post = cur.fetchone()[0]
+            conn.close()
+            db_stats = {
+                "database_posts_count": db_count,
+                "last_post_time": str(last_post) if last_post else None,
+                "database_connected": True
+            }
+        except Exception as e:
+            db_stats = {
+                "database_connected": False,
+                "database_error": str(e)
+            }
+    
     return {
         "processed_posts_count": len(bot_instance.processed_posts),
         "target_user": TARGET_USER,
         "subreddit": SUBREDDIT_NAME,
         "check_interval": CHECK_INTERVAL,
-        "running": bot_instance.running
+        "running": bot_instance.running,
+        "database_url_set": bool(DATABASE_URL),
+        **db_stats
     }
+
+@app.get("/test-db")
+async def test_database():
+    """Test database connection and show recent posts"""
+    if not DATABASE_URL:
+        return {"error": "No DATABASE_URL configured"}
+    
+    try:
+        _ensure_posted_ids_table()
+        conn = _db_connect()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, created_at 
+                FROM posted_reddit_ids 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            """)
+            rows = cur.fetchall()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "message": "Database connection successful",
+            "recent_posts": [
+                {"id": row[0], "created_at": str(row[1])} 
+                for row in rows
+            ],
+            "total_posts": len(rows)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Database connection failed: {e}"
+        }
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -456,7 +603,22 @@ def main():
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     if missing_vars:
         logger.error(f"Missing required environment variables: {missing_vars}")
+        logger.error("Please set these variables in Render.com Environment Variables section")
         return
+    
+    # Test database connection if DATABASE_URL is provided
+    if DATABASE_URL:
+        try:
+            _ensure_posted_ids_table()
+            logger.info("✅ Database connection successful")
+        except Exception as e:
+            logger.error(f"❌ Database connection failed: {e}")
+            if FAIL_IF_DB_UNAVAILABLE:
+                logger.error("Database is required but unavailable. Exiting.")
+                return
+            logger.warning("Continuing without database (file fallback)")
+    else:
+        logger.warning("No DATABASE_URL provided, using file storage")
     
     # Start bot in background thread
     bot_thread = threading.Thread(target=start_bot_in_thread, daemon=True)
