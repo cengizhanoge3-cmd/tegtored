@@ -767,11 +767,29 @@ async def process_once(request: Request):
     if not bot_instance:
         return {"error": "Bot not initialized"}
     try:
-        payload = await request.json()
+        # Accept JSON body, plain text body, or query param ?url=
+        payload = {}
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            # Not JSON; try to read raw body as url
+            try:
+                raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+            except Exception:
+                raw = ""
+            if raw and raw.startswith("http"):
+                payload = {"url": raw}
+        # Also consider query params
+        qp_url = request.query_params.get("url")
+        if qp_url and not payload.get("url"):
+            payload["url"] = qp_url
+
         url = (payload.get("url") or "").strip()
         save = bool(payload.get("save", False))
         if not url:
-            return {"status": "error", "message": "'url' is required"}
+            return {"status": "error", "message": "'url' is required. Send JSON {\"url\": \"...\"} or use ?url=..."}
 
         # Fetch submission directly by URL
         submission = bot_instance.reddit.submission(url=url)
