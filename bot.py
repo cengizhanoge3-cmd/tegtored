@@ -27,6 +27,8 @@ import re
 from typing import Tuple
 import tempfile
 import shutil
+import subprocess
+import uuid
 
 # Redvid downloader for Reddit videos
 try:
@@ -247,6 +249,111 @@ class RedditToTelegramBot:
         except Exception as e:
             logger.error(f"Error saving processed post to file: {e}")
     
+    async def compress_video_to_size(self, input_path: str, target_size_bytes: int) -> str:
+        """
+        Compress video to target size using FFmpeg
+        Returns path to compressed video or None if failed
+        """
+        try:
+            # Generate output path
+            output_path = input_path.replace('.mp4', f'_compressed_{uuid.uuid4().hex[:8]}.mp4')
+            
+            # Get video duration for bitrate calculation
+            duration_cmd = [
+                'ffmpeg', '-i', input_path, '-f', 'null', '-', 
+                '-hide_banner', '-loglevel', 'error'
+            ]
+            
+            try:
+                result = await asyncio.to_thread(
+                    lambda: subprocess.run(duration_cmd, capture_output=True, text=True, timeout=30)
+                )
+                # Extract duration from stderr (ffmpeg outputs info to stderr)
+                duration_line = [line for line in result.stderr.split('\n') if 'Duration:' in line]
+                if duration_line:
+                    duration_str = duration_line[0].split('Duration: ')[1].split(',')[0]
+                    h, m, s = duration_str.split(':')
+                    duration_seconds = int(h) * 3600 + int(m) * 60 + float(s)
+                else:
+                    duration_seconds = 60  # Default fallback
+            except Exception:
+                duration_seconds = 60  # Default fallback
+            
+            # Calculate target bitrate (leaving some margin)
+            target_bitrate_kbps = int((target_size_bytes * 8) / (duration_seconds * 1024) * 0.9)  # 90% of theoretical max
+            
+            # Ensure minimum quality
+            if target_bitrate_kbps < 100:
+                target_bitrate_kbps = 100
+            
+            logger.info(f"Compressing video: target bitrate {target_bitrate_kbps}k for {duration_seconds}s duration")
+            
+            # Compression command with two-pass encoding for better quality
+            compress_cmd = [
+                'ffmpeg', '-i', input_path,
+                '-c:v', 'libx264',
+                '-b:v', f'{target_bitrate_kbps}k',
+                '-maxrate', f'{int(target_bitrate_kbps * 1.2)}k',
+                '-bufsize', f'{int(target_bitrate_kbps * 2)}k',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-movflags', '+faststart',
+                '-preset', 'medium',
+                '-crf', '28',
+                '-y',  # Overwrite output
+                output_path,
+                '-hide_banner', '-loglevel', 'error'
+            ]
+            
+            # Run compression
+            result = await asyncio.to_thread(
+                lambda: subprocess.run(compress_cmd, capture_output=True, text=True, timeout=300)
+            )
+            
+            if result.returncode == 0 and os.path.exists(output_path):
+                compressed_size = os.path.getsize(output_path)
+                original_size = os.path.getsize(input_path)
+                logger.info(f"Compression successful: {original_size} -> {compressed_size} bytes ({compressed_size/original_size*100:.1f}%)")
+                
+                # If still too large, try more aggressive compression
+                if compressed_size > target_size_bytes:
+                    logger.info("Still too large, trying more aggressive compression...")
+                    output_path2 = output_path.replace('.mp4', '_aggressive.mp4')
+                    
+                    aggressive_cmd = [
+                        'ffmpeg', '-i', output_path,
+                        '-c:v', 'libx264',
+                        '-b:v', f'{int(target_bitrate_kbps * 0.7)}k',
+                        '-c:a', 'aac',
+                        '-b:a', '64k',
+                        '-preset', 'slow',
+                        '-crf', '32',
+                        '-vf', 'scale=-2:720',  # Scale down to 720p max
+                        '-y',
+                        output_path2,
+                        '-hide_banner', '-loglevel', 'error'
+                    ]
+                    
+                    result2 = await asyncio.to_thread(
+                        lambda: subprocess.run(aggressive_cmd, capture_output=True, text=True, timeout=300)
+                    )
+                    
+                    if result2.returncode == 0 and os.path.exists(output_path2):
+                        try:
+                            os.remove(output_path)
+                        except Exception:
+                            pass
+                        return output_path2
+                
+                return output_path
+            else:
+                logger.error(f"FFmpeg compression failed: {result.stderr}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Video compression error: {e}")
+            return None
+
     def get_bot_comment_continuation(self, submission: Submission) -> str:
         """Get BFHaber_Bot's comment if post text is truncated"""
         try:
@@ -380,7 +487,9 @@ class RedditToTelegramBot:
                                         url=media_url,
                                         max_q=True,
                                         overwrite=True,
-                                        log=False  # Disable redvid logging to avoid console spam
+                                        log=False,  # Disable redvid logging to avoid console spam
+                                        max_s=50*1024*1024,  # Allow up to 50MB videos (Telegram limit)
+                                        max_d=600  # Allow up to 10 minutes duration
                                     )
                                     
                                     # Download video - returns file path or error code
@@ -390,14 +499,17 @@ class RedditToTelegramBot:
                                         # Success - result is the file path
                                         logger.info(f"Successfully downloaded video: {result} ({os.path.getsize(result)} bytes)")
                                         
-                                        # Send video to Telegram
+                                        # Send video to Telegram (force as video, not animation/GIF)
                                         with open(result, 'rb') as f:
                                             try:
                                                 await self.telegram_bot.send_video(
                                                     chat_id=TELEGRAM_CHAT_ID,
                                                     video=f,
                                                     caption=message,
-                                                    parse_mode='Markdown'
+                                                    parse_mode='Markdown',
+                                                    supports_streaming=True,
+                                                    width=None,  # Let Telegram detect
+                                                    height=None  # Let Telegram detect
                                                 )
                                             except TelegramError as te:
                                                 logger.warning(f"Video caption Markdown failed, retrying without parse_mode: {te}")
@@ -405,7 +517,10 @@ class RedditToTelegramBot:
                                                     chat_id=TELEGRAM_CHAT_ID,
                                                     video=f,
                                                     caption=message,
-                                                    parse_mode=None
+                                                    parse_mode=None,
+                                                    supports_streaming=True,
+                                                    width=None,
+                                                    height=None
                                                 )
                                         video_sent = True
                                         caption_attached = True
@@ -419,13 +534,76 @@ class RedditToTelegramBot:
                                     else:
                                         # Handle error codes
                                         if result == 0:
-                                            logger.warning("Video size exceeds maximum limit")
+                                            logger.warning(f"Video size exceeds 50MB limit for {media_url}, trying to compress...")
+                                            # Try to download without size limit and compress
+                                            try:
+                                                rd_large = RedvidDownloader(
+                                                    url=media_url,
+                                                    max_q=True,
+                                                    overwrite=True,
+                                                    log=False,
+                                                    max_s=1e1000,  # No size limit for initial download
+                                                    max_d=600
+                                                )
+                                                large_result = await asyncio.to_thread(rd_large.download)
+                                                
+                                                if isinstance(large_result, str) and os.path.exists(large_result):
+                                                    # Compress the video to fit under 50MB
+                                                    compressed_path = await self.compress_video_to_size(large_result, 45*1024*1024)  # 45MB target
+                                                    
+                                                    if compressed_path and os.path.exists(compressed_path):
+                                                        logger.info(f"Successfully compressed video: {compressed_path} ({os.path.getsize(compressed_path)} bytes)")
+                                                        
+                                                        # Send compressed video
+                                                        with open(compressed_path, 'rb') as f:
+                                                            try:
+                                                                await self.telegram_bot.send_video(
+                                                                    chat_id=TELEGRAM_CHAT_ID,
+                                                                    video=f,
+                                                                    caption=message + "\n\n🗜️ *Compressed for Telegram*",
+                                                                    parse_mode='Markdown',
+                                                                    supports_streaming=True,
+                                                                    width=None,
+                                                                    height=None
+                                                                )
+                                                            except TelegramError as te:
+                                                                logger.warning(f"Compressed video Markdown failed: {te}")
+                                                                await self.telegram_bot.send_video(
+                                                                    chat_id=TELEGRAM_CHAT_ID,
+                                                                    video=f,
+                                                                    caption=message + "\n\n🗜️ Compressed for Telegram",
+                                                                    parse_mode=None,
+                                                                    supports_streaming=True,
+                                                                    width=None,
+                                                                    height=None
+                                                                )
+                                                        video_sent = True
+                                                        caption_attached = True
+                                                        logger.info("Compressed video sent successfully to Telegram")
+                                                        
+                                                        # Clean up both files
+                                                        try:
+                                                            os.remove(large_result)
+                                                            os.remove(compressed_path)
+                                                        except Exception:
+                                                            pass
+                                                    else:
+                                                        logger.warning("Video compression failed")
+                                                        # Clean up original file
+                                                        try:
+                                                            os.remove(large_result)
+                                                        except Exception:
+                                                            pass
+                                                else:
+                                                    logger.warning("Could not download large video for compression")
+                                            except Exception as comp_e:
+                                                logger.warning(f"Compression attempt failed: {comp_e}")
                                         elif result == 1:
-                                            logger.warning("Video duration exceeds maximum limit")
+                                            logger.warning(f"Video duration exceeds 10 minutes for {media_url}")
                                         elif result == 2:
-                                            logger.warning("Video file already exists")
+                                            logger.info(f"Video file already exists, will try to use it")
                                         else:
-                                            logger.warning(f"Unexpected redvid result: {result}")
+                                            logger.warning(f"Unexpected redvid result: {result} for {media_url}")
                                         
                                 except Exception as e:
                                     logger.warning(f"redvid download failed for {media_url}: {e}")
@@ -449,7 +627,8 @@ class RedditToTelegramBot:
                                         chat_id=TELEGRAM_CHAT_ID,
                                         video=media_url,
                                         caption=message,
-                                        parse_mode='Markdown'
+                                        parse_mode='Markdown',
+                                        supports_streaming=True
                                     )
                                     video_sent = True
                                     caption_attached = True
@@ -461,7 +640,8 @@ class RedditToTelegramBot:
                                             chat_id=TELEGRAM_CHAT_ID,
                                             video=media_url,
                                             caption=message,
-                                            parse_mode=None
+                                            parse_mode=None,
+                                            supports_streaming=True
                                         )
                                         video_sent = True
                                         caption_attached = True
