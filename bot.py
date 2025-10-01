@@ -484,6 +484,16 @@ class RedditToTelegramBot:
                             if 'v.redd.it' in url_lower and REDVID_AVAILABLE and reddit_post_url:
                                 try:
                                     logger.info(f"Attempting redvid download for Reddit post: {reddit_post_url}")
+                                    # Ensure ffmpeg is available for redvid muxing (audio+video)
+                                    try:
+                                        import imageio_ffmpeg
+                                        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                                        ff_dir = os.path.dirname(ffmpeg_exe)
+                                        os.environ['FFMPEG_BINARY'] = ffmpeg_exe
+                                        os.environ['PATH'] = ff_dir + os.pathsep + os.environ.get('PATH', '')
+                                        logger.info(f"ffmpeg configured from imageio-ffmpeg: {ffmpeg_exe}")
+                                    except Exception as fferr:
+                                        logger.warning(f"Could not configure ffmpeg from imageio-ffmpeg: {fferr}")
                                     
                                     # Create downloader with proper settings using Reddit post URL
                                     rd = RedvidDownloader(
@@ -540,6 +550,17 @@ class RedditToTelegramBot:
                                             logger.warning(f"Video size exceeds 50MB limit for {media_url}, trying to compress...")
                                             # Try to download without size limit and compress
                                             try:
+                                                # Ensure ffmpeg is available for redvid muxing (audio+video)
+                                                try:
+                                                    import imageio_ffmpeg
+                                                    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                                                    ff_dir = os.path.dirname(ffmpeg_exe)
+                                                    os.environ['FFMPEG_BINARY'] = ffmpeg_exe
+                                                    os.environ['PATH'] = ff_dir + os.pathsep + os.environ.get('PATH', '')
+                                                    logger.info(f"ffmpeg configured from imageio-ffmpeg: {ffmpeg_exe}")
+                                                except Exception as fferr:
+                                                    logger.warning(f"Could not configure ffmpeg from imageio-ffmpeg: {fferr}")
+
                                                 rd_large = RedvidDownloader(
                                                     url=reddit_post_url,
                                                     max_q=True,
