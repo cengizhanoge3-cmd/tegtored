@@ -333,6 +333,8 @@ class RedditToTelegramBot:
             
             # Send media first if available
             if media_urls:
+                sent_fallback = False
+                caption_attached = False
                 for media_url in media_urls[:10]:  # Limit to 10 media items
                     try:
                         # Determine media type
@@ -366,9 +368,12 @@ class RedditToTelegramBot:
                                         tmp_dir = tempfile.gettempdir()
                                         ext = '.mp4'
                                         path = os.path.join(tmp_dir, f"reddit_vid_{uuid.uuid4().hex}{ext}")
-                                        # Use a browser-like User-Agent; some CDNs block default urllib UA
+                                        # Use browser-like headers; some CDNs block default urllib UA or missing referer
                                         req = urllib.request.Request(media_url, headers={
-                                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+                                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+                                            'Referer': 'https://www.reddit.com/',
+                                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                                            'Accept-Language': 'en-US,en;q=0.9'
                                         })
                                         with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as f:
                                             f.write(r.read())
@@ -385,10 +390,11 @@ class RedditToTelegramBot:
                                 try:
                                     with open(video_path, 'rb') as f:
                                         try:
+                                            # Always include caption for video to avoid textless video
                                             await self.telegram_bot.send_video(
                                                 chat_id=TELEGRAM_CHAT_ID,
                                                 video=f,
-                                                caption=message if len(media_urls) == 1 else None,
+                                                caption=message,
                                                 parse_mode='Markdown'
                                             )
                                         except TelegramError as te:
@@ -396,9 +402,11 @@ class RedditToTelegramBot:
                                             await self.telegram_bot.send_video(
                                                 chat_id=TELEGRAM_CHAT_ID,
                                                 video=f,
-                                                caption=message if len(media_urls) == 1 else None,
+                                                caption=message,
                                                 parse_mode=None
                                             )
+                                        # Mark that we already sent caption with the video
+                                        caption_attached = True
                                 finally:
                                     try:
                                         os.remove(video_path)
@@ -422,6 +430,9 @@ class RedditToTelegramBot:
                                         parse_mode=None,
                                         disable_web_page_preview=False
                                     )
+                                # Ensure only a single Telegram message is sent in this failure scenario
+                                sent_fallback = True
+                                break
                         else:
                             # Send as document for other formats
                             try:
@@ -446,8 +457,8 @@ class RedditToTelegramBot:
                         logger.warning(f"Failed to send media {media_url}: {media_error}")
                         continue
                 
-                # If multiple media items, send text separately
-                if len(media_urls) > 1:
+                # If multiple media items, send text separately unless caption already attached to the video
+                if len(media_urls) > 1 and not sent_fallback and not caption_attached:
                     try:
                         await self.telegram_bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
