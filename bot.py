@@ -43,7 +43,8 @@ except ImportError:
     logger.warning("asyncpg not available, using file storage only")
 
 # Configuration
-TELEGRAM_BOT_TOKEN = "8343304363:AAH20G_levf2X_w0AhZq4Lz3ORNV-WSmlm4"
+# IMPORTANT: Read sensitive tokens from environment variables
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # Channel or group ID to post to
 
 # Reddit configuration
@@ -301,7 +302,12 @@ class RedditToTelegramBot:
                             media_urls.append(img_url)
         
         # Add source link at the end (smaller, less prominent)
-        message += f"🔗 [Kaynak]({submission.url})"
+        # Always point to the Reddit post, not the media URL
+        try:
+            reddit_link = f"https://reddit.com{submission.permalink}"
+        except Exception:
+            reddit_link = submission.url
+        message += f"🔗 [Kaynak]({reddit_link})"
         
         return message, media_urls
     
@@ -493,6 +499,11 @@ async def root():
     """Health check endpoint"""
     return {"status": "ok", "message": "Reddit to Telegram Bot is running"}
 
+@app.get("/ping")
+async def ping():
+    """Simple ping endpoint for uptime checks"""
+    return {"status": "alive"}
+
 @app.get("/health")
 async def health_check():
     """Health check for Render.com"""
@@ -576,6 +587,79 @@ async def test_database():
 async def webhook(request: Request):
     """Webhook endpoint (for future use)"""
     return {"status": "received"}
+
+@app.post("/test-telegram")
+async def test_telegram():
+    """Send a test message to the configured Telegram chat to verify token/chat id/permissions"""
+    try:
+        if not TELEGRAM_BOT_TOKEN:
+            return {"status": "error", "message": "TELEGRAM_BOT_TOKEN not set"}
+        if not TELEGRAM_CHAT_ID:
+            return {"status": "error", "message": "TELEGRAM_CHAT_ID not set"}
+        global bot_instance
+        if not bot_instance:
+            bot = Bot(token=TELEGRAM_BOT_TOKEN)
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Test message from Reddit->Telegram service", disable_web_page_preview=True)
+        else:
+            await bot_instance.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Test message from Reddit->Telegram service", disable_web_page_preview=True)
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Telegram test failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/trigger-scan")
+async def trigger_scan():
+    """Trigger a one-off scan and forward of new posts without waiting for the loop interval"""
+    global bot_instance
+    if not bot_instance:
+        return {"error": "Bot not initialized"}
+    # Run scan in the web server event loop
+    try:
+        asyncio.create_task(bot_instance.process_new_posts())
+        return {"status": "scheduled"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/post_to_reddit")
+async def post_to_reddit(request: Request):
+    """Submit a post to Reddit.
+    Body JSON: {"title": str, "selftext": str|optional, "url": str|optional, "subreddit": str|optional}
+    """
+    global bot_instance
+    if not bot_instance:
+        return {"error": "Bot not initialized"}
+    try:
+        payload = await request.json()
+        title = (payload.get("title") or "").strip()
+        selftext = (payload.get("selftext") or "").strip()
+        url = (payload.get("url") or "").strip()
+        subreddit_name = (payload.get("subreddit") or SUBREDDIT_NAME).strip()
+
+        if not title:
+            return {"status": "error", "message": "'title' is required"}
+        if not selftext and not url:
+            return {"status": "error", "message": "Provide either 'selftext' or 'url'"}
+
+        subreddit = bot_instance.reddit.subreddit(subreddit_name)
+
+        def _submit():
+            if url:
+                return subreddit.submit(title=title, url=url, resubmit=True)
+            else:
+                return subreddit.submit(title=title, selftext=selftext)
+
+        submission = await asyncio.to_thread(_submit)
+        return {
+            "status": "success",
+            "id": submission.id,
+            "title": submission.title,
+            "permalink": f"https://reddit.com{submission.permalink}",
+            "shortlink": submission.shortlink,
+            "subreddit": subreddit_name,
+        }
+    except Exception as e:
+        logger.error(f"Error posting to Reddit: {e}")
+        return {"status": "error", "message": str(e)}
 
 def start_bot_in_thread():
     """Start bot in separate thread"""
