@@ -756,6 +756,50 @@ async def test_telegram():
         logger.error(f"Telegram test failed: {e}")
         return {"status": "error", "message": str(e)}
 
+@app.post("/process-once")
+async def process_once(request: Request):
+    """Process a single Reddit URL immediately, bypassing normal filters.
+    Body JSON: {"url": str, "save": bool|optional}
+    - save=false (default): do not store ID, so it won't affect future scans
+    - save=true: store ID to prevent future duplicates
+    """
+    global bot_instance
+    if not bot_instance:
+        return {"error": "Bot not initialized"}
+    try:
+        payload = await request.json()
+        url = (payload.get("url") or "").strip()
+        save = bool(payload.get("save", False))
+        if not url:
+            return {"status": "error", "message": "'url' is required"}
+
+        # Fetch submission directly by URL
+        submission = bot_instance.reddit.submission(url=url)
+        # Ensure data is loaded
+        submission._fetch()
+
+        # Format and send using existing logic (with robust media handling)
+        message, media_urls = bot_instance.format_post_for_telegram(submission)
+        sent = await bot_instance.send_to_telegram(message, media_urls)
+
+        if sent and save:
+            try:
+                await bot_instance.save_processed_post(submission.id)
+                bot_instance.processed_posts.add(submission.id)
+            except Exception as se:
+                logger.warning(f"Saving processed post failed: {se}")
+
+        return {
+            "status": "success" if sent else "failed",
+            "id": submission.id,
+            "title": submission.title,
+            "permalink": f"https://reddit.com{submission.permalink}",
+            "saved": bool(save and sent)
+        }
+    except Exception as e:
+        logger.error(f"Error in process_once: {e}")
+        return {"status": "error", "message": str(e)}
+
 @app.post("/trigger-scan")
 async def trigger_scan():
     """Trigger a one-off scan and forward of new posts without waiting for the loop interval"""
