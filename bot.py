@@ -370,7 +370,7 @@ class RedditToTelegramBot:
             logger.warning(f"Error getting bot comment: {e}")
             return ""
     
-    def format_post_for_telegram(self, submission: Submission) -> tuple[str, list]:
+    def format_post_for_telegram(self, submission: Submission) -> tuple[str, list, str]:
         """Format Reddit post for Telegram. Returns (message, media_urls)"""
         title = submission.title
         
@@ -438,9 +438,12 @@ class RedditToTelegramBot:
         
         # No source link appended
         
-        return message, media_urls
+        # Get Reddit post URL for redvid
+        reddit_post_url = f"https://reddit.com{submission.permalink}"
+        
+        return message, media_urls, reddit_post_url
     
-    async def send_to_telegram(self, message: str, media_urls: list = None):
+    async def send_to_telegram(self, message: str, media_urls: list = None, reddit_post_url: str = None):
         """Send message with media to Telegram"""
         try:
             if not TELEGRAM_CHAT_ID:
@@ -478,19 +481,19 @@ class RedditToTelegramBot:
                             video_sent = False
                             
                             # Try redvid for Reddit videos
-                            if 'v.redd.it' in url_lower and REDVID_AVAILABLE:
+                            if 'v.redd.it' in url_lower and REDVID_AVAILABLE and reddit_post_url:
                                 try:
-                                    logger.info(f"Attempting redvid download for: {media_url}")
+                                    logger.info(f"Attempting redvid download for Reddit post: {reddit_post_url}")
                                     
-                                    # Create downloader with proper settings
+                                    # Create downloader with proper settings using Reddit post URL
                                     rd = RedvidDownloader(
-                                        url=media_url,
+                                        url=reddit_post_url,
                                         max_q=True,
-                                        overwrite=True,
                                         log=False,  # Disable redvid logging to avoid console spam
                                         max_s=50*1024*1024,  # Allow up to 50MB videos (Telegram limit)
                                         max_d=600  # Allow up to 10 minutes duration
                                     )
+                                    rd.overwrite = True  # Set overwrite after initialization
                                     
                                     # Download video - returns file path or error code
                                     result = await asyncio.to_thread(rd.download)
@@ -538,13 +541,13 @@ class RedditToTelegramBot:
                                             # Try to download without size limit and compress
                                             try:
                                                 rd_large = RedvidDownloader(
-                                                    url=media_url,
+                                                    url=reddit_post_url,
                                                     max_q=True,
-                                                    overwrite=True,
                                                     log=False,
                                                     max_s=1e1000,  # No size limit for initial download
                                                     max_d=600
                                                 )
+                                                rd_large.overwrite = True  # Set overwrite after initialization
                                                 large_result = await asyncio.to_thread(rd_large.download)
                                                 
                                                 if isinstance(large_result, str) and os.path.exists(large_result):
@@ -819,10 +822,10 @@ class RedditToTelegramBot:
             for submission in new_posts:
                 try:
                     # Format message and get media URLs
-                    message, media_urls = self.format_post_for_telegram(submission)
+                    message, media_urls, reddit_post_url = self.format_post_for_telegram(submission)
                     
                     # Send to Telegram with media
-                    success = await self.send_to_telegram(message, media_urls)
+                    success = await self.send_to_telegram(message, media_urls, reddit_post_url)
                     
                     if success:
                         # Mark as processed (save to database/file)
@@ -1039,8 +1042,8 @@ async def process_once(request: Request):
         submission._fetch()
 
         # Format and send using existing logic (with robust media handling)
-        message, media_urls = bot_instance.format_post_for_telegram(submission)
-        sent = await bot_instance.send_to_telegram(message, media_urls)
+        message, media_urls, reddit_post_url = bot_instance.format_post_for_telegram(submission)
+        sent = await bot_instance.send_to_telegram(message, media_urls, reddit_post_url)
 
         if sent and save:
             try:
