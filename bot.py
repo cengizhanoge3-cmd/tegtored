@@ -23,6 +23,9 @@ import uvicorn
 
 # Environment variables
 from dotenv import load_dotenv
+import urllib.request
+import tempfile
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -290,16 +293,32 @@ class RedditToTelegramBot:
             # Reddit video
             elif 'v.redd.it' in url:
                 media_urls.append(submission.url)
-            # Reddit gallery
-            elif hasattr(submission, 'is_gallery') and submission.is_gallery:
-                if hasattr(submission, 'media_metadata'):
-                    for item_id in submission.media_metadata:
-                        item = submission.media_metadata[item_id]
-                        if 's' in item and 'u' in item['s']:
-                            # Convert preview URL to full resolution
-                            img_url = item['s']['u'].replace('preview.redd.it', 'i.redd.it')
-                            img_url = img_url.split('?')[0]  # Remove query parameters
-                            media_urls.append(img_url)
+        
+        # Improve Reddit video handling: prefer fallback_url (direct mp4)
+        try:
+            if getattr(submission, 'is_video', False) or ('v.redd.it' in (submission.url.lower() if hasattr(submission, 'url') and submission.url else '')):
+                rv = None
+                if getattr(submission, 'media', None) and isinstance(submission.media, dict):
+                    rv = submission.media.get('reddit_video')
+                if not rv and getattr(submission, 'secure_media', None) and isinstance(submission.secure_media, dict):
+                    rv = submission.secure_media.get('reddit_video')
+                if rv and isinstance(rv, dict) and rv.get('fallback_url'):
+                    fallback = rv.get('fallback_url')
+                    # Put fallback first so sender tries it first
+                    media_urls = [fallback] + [u for u in media_urls if u != fallback]
+        except Exception as e:
+            logger.warning(f"Error extracting reddit video fallback: {e}")
+
+        # Reddit gallery
+        if hasattr(submission, 'is_gallery') and submission.is_gallery:
+            if hasattr(submission, 'media_metadata'):
+                for item_id in submission.media_metadata:
+                    item = submission.media_metadata[item_id]
+                    if 's' in item and 'u' in item['s']:
+                        # Convert preview URL to full resolution
+                        img_url = item['s']['u'].replace('preview.redd.it', 'i.redd.it')
+                        img_url = img_url.split('?')[0]  # Remove query parameters
+                        media_urls.append(img_url)
         
         # No source link appended
         
@@ -337,22 +356,72 @@ class RedditToTelegramBot:
                                     parse_mode=None
                                 )
                         elif any(url_lower.endswith(ext) for ext in ['.mp4', '.webm', '.mov']) or 'v.redd.it' in url_lower:
-                            # Send as video
-                            try:
-                                await self.telegram_bot.send_video(
-                                    chat_id=TELEGRAM_CHAT_ID,
-                                    video=media_url,
-                                    caption=message if len(media_urls) == 1 else None,
-                                    parse_mode='Markdown'
-                                )
-                            except TelegramError as te:
-                                logger.warning(f"Video caption Markdown failed, retrying without parse_mode: {te}")
-                                await self.telegram_bot.send_video(
-                                    chat_id=TELEGRAM_CHAT_ID,
-                                    video=media_url,
-                                    caption=message if len(media_urls) == 1 else None,
-                                    parse_mode=None
-                                )
+                            # Send as video: try to download and upload to Telegram (more reliable)
+                            video_path = None
+                            download_attempts = 4
+                            last_error = None
+                            for attempt in range(1, download_attempts + 1):
+                                try:
+                                    def _download():
+                                        tmp_dir = tempfile.gettempdir()
+                                        ext = '.mp4'
+                                        path = os.path.join(tmp_dir, f"reddit_vid_{uuid.uuid4().hex}{ext}")
+                                        # Use a browser-like User-Agent; some CDNs block default urllib UA
+                                        req = urllib.request.Request(media_url, headers={
+                                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+                                        })
+                                        with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as f:
+                                            f.write(r.read())
+                                        return path
+                                    video_path = await asyncio.to_thread(_download)
+                                    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+                                        break
+                                except Exception as de:
+                                    last_error = de
+                                    logger.warning(f"Video download attempt {attempt}/{download_attempts} failed: {de}")
+                                    await asyncio.sleep(2 * attempt)
+
+                            if video_path and os.path.exists(video_path):
+                                try:
+                                    with open(video_path, 'rb') as f:
+                                        try:
+                                            await self.telegram_bot.send_video(
+                                                chat_id=TELEGRAM_CHAT_ID,
+                                                video=f,
+                                                caption=message if len(media_urls) == 1 else None,
+                                                parse_mode='Markdown'
+                                            )
+                                        except TelegramError as te:
+                                            logger.warning(f"Video caption Markdown failed, retrying without parse_mode: {te}")
+                                            await self.telegram_bot.send_video(
+                                                chat_id=TELEGRAM_CHAT_ID,
+                                                video=f,
+                                                caption=message if len(media_urls) == 1 else None,
+                                                parse_mode=None
+                                            )
+                                finally:
+                                    try:
+                                        os.remove(video_path)
+                                    except Exception:
+                                        pass
+                            else:
+                                # Could not download after retries: send title/content only, and include video source URL
+                                fallback_text = message + ("\n\nVideo: " + media_url if media_url else "")
+                                try:
+                                    await self.telegram_bot.send_message(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        text=fallback_text,
+                                        parse_mode='Markdown',
+                                        disable_web_page_preview=False
+                                    )
+                                except TelegramError as te:
+                                    logger.warning(f"Fallback text Markdown failed, retrying without parse_mode: {te}")
+                                    await self.telegram_bot.send_message(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        text=fallback_text,
+                                        parse_mode=None,
+                                        disable_web_page_preview=False
+                                    )
                         else:
                             # Send as document for other formats
                             try:
