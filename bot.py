@@ -400,7 +400,7 @@ class RedditToTelegramBot:
                                     if candidates:
                                         candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
                                         video_path = candidates[0]
-                                except Exception as rederr:
+                                except BaseException as rederr:
                                     logger.warning(f"redvid download failed: {rederr}")
                                 finally:
                                     # Do not remove tmp_dir yet if video_path points inside it; we'll clean later
