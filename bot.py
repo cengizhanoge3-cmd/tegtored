@@ -26,6 +26,9 @@ from dotenv import load_dotenv
 import urllib.request
 import tempfile
 import uuid
+import re
+import subprocess
+from typing import Tuple
 
 # Load environment variables
 load_dotenv()
@@ -304,8 +307,8 @@ class RedditToTelegramBot:
                     rv = submission.secure_media.get('reddit_video')
                 if rv and isinstance(rv, dict) and rv.get('fallback_url'):
                     fallback = rv.get('fallback_url')
-                    # Put fallback first so sender tries it first
-                    media_urls = [fallback] + [u for u in media_urls if u != fallback]
+                    # Put fallback first so sender tries it first and drop other v.redd.it placeholders
+                    media_urls = [fallback] + [u for u in media_urls if (u != fallback and 'v.redd.it' not in u.lower())]
         except Exception as e:
             logger.warning(f"Error extracting reddit video fallback: {e}")
 
@@ -360,6 +363,8 @@ class RedditToTelegramBot:
                         elif any(url_lower.endswith(ext) for ext in ['.mp4', '.webm', '.mov']) or 'v.redd.it' in url_lower:
                             # Send as video: try to download and upload to Telegram (more reliable)
                             video_path = None
+                            audio_path = None
+                            merged_path = None
                             download_attempts = 4
                             last_error = None
                             for attempt in range(1, download_attempts + 1):
@@ -386,32 +391,111 @@ class RedditToTelegramBot:
                                     logger.warning(f"Video download attempt {attempt}/{download_attempts} failed: {de}")
                                     await asyncio.sleep(2 * attempt)
 
+                            # Try to also download audio for v.redd.it (DASH audio)
+                            if 'v.redd.it' in url_lower:
+                                try:
+                                    # Derive audio URL from fallback/video URL pattern
+                                    # Examples: .../DASH_720.mp4 -> .../DASH_audio.mp4
+                                    # Strip query params for derivation, then re-attach if needed
+                                    base_no_q = media_url.split('?')[0]
+                                    audio_candidate = re.sub(r"DASH_[^/.]+\.mp4$", "DASH_audio.mp4", base_no_q)
+                                    if audio_candidate != base_no_q:
+                                        def _download_audio():
+                                            tmp_dir = tempfile.gettempdir()
+                                            path = os.path.join(tmp_dir, f"reddit_aud_{uuid.uuid4().hex}.mp4")
+                                            req = urllib.request.Request(audio_candidate, headers={
+                                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+                                                'Referer': 'https://www.reddit.com/',
+                                                'Accept': '*/*',
+                                                'Accept-Language': 'en-US,en;q=0.9'
+                                            })
+                                            with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as f:
+                                                f.write(r.read())
+                                            return path
+                                        audio_path = await asyncio.to_thread(_download_audio)
+                                        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                                            audio_path = None
+                                except Exception as ae:
+                                    logger.warning(f"Audio download failed: {ae}")
+
                             if video_path and os.path.exists(video_path):
                                 try:
-                                    with open(video_path, 'rb') as f:
+                                    # If we have audio too, try to mux with ffmpeg
+                                    if audio_path and os.path.exists(audio_path):
                                         try:
-                                            # Always include caption for video to avoid textless video
-                                            await self.telegram_bot.send_video(
-                                                chat_id=TELEGRAM_CHAT_ID,
-                                                video=f,
-                                                caption=message,
-                                                parse_mode='Markdown'
-                                            )
-                                        except TelegramError as te:
-                                            logger.warning(f"Video caption Markdown failed, retrying without parse_mode: {te}")
-                                            await self.telegram_bot.send_video(
-                                                chat_id=TELEGRAM_CHAT_ID,
-                                                video=f,
-                                                caption=message,
-                                                parse_mode=None
-                                            )
-                                        # Mark that we already sent caption with the video
+                                            merged_path = os.path.join(tempfile.gettempdir(), f"reddit_mux_{uuid.uuid4().hex}.mp4")
+                                            ffmpeg_path = None
+                                            try:
+                                                import imageio_ffmpeg
+                                                ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+                                            except Exception:
+                                                ffmpeg_path = 'ffmpeg'  # hope it's in PATH
+                                            cmd = [ffmpeg_path, '-y', '-i', video_path, '-i', audio_path, '-c', 'copy', '-shortest', merged_path]
+                                            proc = await asyncio.to_thread(lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                                            if proc.returncode == 0 and os.path.exists(merged_path) and os.path.getsize(merged_path) > 0:
+                                                # Use merged file
+                                                with open(merged_path, 'rb') as f:
+                                                    try:
+                                                        await self.telegram_bot.send_video(
+                                                            chat_id=TELEGRAM_CHAT_ID,
+                                                            video=f,
+                                                            caption=message,
+                                                            parse_mode='Markdown'
+                                                        )
+                                                    except TelegramError as te:
+                                                        logger.warning(f"Video (muxed) caption Markdown failed, retrying without parse_mode: {te}")
+                                                        await self.telegram_bot.send_video(
+                                                            chat_id=TELEGRAM_CHAT_ID,
+                                                            video=f,
+                                                            caption=message,
+                                                            parse_mode=None
+                                                        )
+                                                caption_attached = True
+                                            else:
+                                                logger.warning("ffmpeg mux failed; sending video-only")
+                                        except Exception as me:
+                                            logger.warning(f"ffmpeg merge error: {me}")
+
+                                    # If no merged file was sent, send the video-only file
+                                    if not caption_attached:
+                                        with open(video_path, 'rb') as f:
+                                            try:
+                                                # Always include caption for video to avoid textless video
+                                                await self.telegram_bot.send_video(
+                                                    chat_id=TELEGRAM_CHAT_ID,
+                                                    video=f,
+                                                    caption=message,
+                                                    parse_mode='Markdown'
+                                                )
+                                            except TelegramError as te:
+                                                logger.warning(f"Video caption Markdown failed, retrying without parse_mode: {te}")
+                                                await self.telegram_bot.send_video(
+                                                    chat_id=TELEGRAM_CHAT_ID,
+                                                    video=f,
+                                                    caption=message,
+                                                    parse_mode=None
+                                                )
+                                            # Mark that we already sent caption with the video
                                         caption_attached = True
+                                        # Remove non-fallback v.redd.it URLs to prevent duplicates
+                                        media_urls = [u for u in media_urls if 'v.redd.it' not in u.lower() or 'fallback_url' in u.lower()]
+                                        # We successfully sent the video; stop processing other media to avoid duplicates
+                                        break
                                 finally:
                                     try:
                                         os.remove(video_path)
                                     except Exception:
                                         pass
+                                    if audio_path:
+                                        try:
+                                            os.remove(audio_path)
+                                        except Exception:
+                                            pass
+                                    if merged_path:
+                                        try:
+                                            os.remove(merged_path)
+                                        except Exception:
+                                            pass
                             else:
                                 # Could not download after retries: send title/content only, and include video source URL
                                 fallback_text = message + ("\n\nVideo: " + media_url if media_url else "")
