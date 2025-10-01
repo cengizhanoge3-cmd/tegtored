@@ -29,6 +29,14 @@ import uuid
 import re
 import subprocess
 from typing import Tuple
+import shutil
+
+# Optional redvid downloader for Reddit videos
+try:
+    from redvid import Downloader as RedvidDownloader
+    REDVID_AVAILABLE = True
+except Exception:
+    REDVID_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -367,8 +375,46 @@ class RedditToTelegramBot:
                             merged_path = None
                             download_attempts = 4
                             last_error = None
+
+                            # 1) Prefer redvid for v.redd.it to fetch video+audio automatically
+                            if 'v.redd.it' in url_lower and REDVID_AVAILABLE:
+                                tmp_dir = tempfile.mkdtemp(prefix="redvid_")
+                                try:
+                                    # If imageio-ffmpeg exists, hint ffmpeg path to environment so redvid can use it
+                                    try:
+                                        import imageio_ffmpeg
+                                        os.environ.setdefault('FFMPEG_BINARY', imageio_ffmpeg.get_ffmpeg_exe())
+                                    except Exception:
+                                        pass
+                                    rd = RedvidDownloader(max_q=True)
+                                    rd.url = media_url
+                                    rd.path = tmp_dir
+                                    # Silence redvid logs if possible
+                                    try:
+                                        rd.overwrite = True
+                                    except Exception:
+                                        pass
+                                    await asyncio.to_thread(rd.download)
+                                    # Pick the largest mp4 in tmp_dir
+                                    candidates = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.lower().endswith('.mp4')]
+                                    if candidates:
+                                        candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
+                                        video_path = candidates[0]
+                                except Exception as rederr:
+                                    logger.warning(f"redvid download failed: {rederr}")
+                                finally:
+                                    # Do not remove tmp_dir yet if video_path points inside it; we'll clean later
+                                    if not video_path:
+                                        try:
+                                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                                        except Exception:
+                                            pass
+
+                            # 2) If redvid not used or failed, fallback to manual download + optional ffmpeg mux
                             for attempt in range(1, download_attempts + 1):
                                 try:
+                                    if video_path:
+                                        break
                                     def _download():
                                         tmp_dir = tempfile.gettempdir()
                                         ext = '.mp4'
@@ -430,8 +476,16 @@ class RedditToTelegramBot:
                                                 ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
                                             except Exception:
                                                 ffmpeg_path = 'ffmpeg'  # hope it's in PATH
+                                            # Try stream copy merge first (fast)
                                             cmd = [ffmpeg_path, '-y', '-i', video_path, '-i', audio_path, '-c', 'copy', '-shortest', merged_path]
                                             proc = await asyncio.to_thread(lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                                            if proc.returncode != 0 or not (os.path.exists(merged_path) and os.path.getsize(merged_path) > 0):
+                                                # Fallback: re-encode audio to AAC, copy video
+                                                logger.warning("ffmpeg copy mux failed; retrying with AAC re-encode for audio")
+                                                cmd = [ffmpeg_path, '-y', '-i', video_path, '-i', audio_path,
+                                                       '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', merged_path]
+                                                proc = await asyncio.to_thread(lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+
                                             if proc.returncode == 0 and os.path.exists(merged_path) and os.path.getsize(merged_path) > 0:
                                                 # Use merged file
                                                 with open(merged_path, 'rb') as f:
