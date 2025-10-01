@@ -23,20 +23,18 @@ import uvicorn
 
 # Environment variables
 from dotenv import load_dotenv
-import urllib.request
-import tempfile
-import uuid
 import re
-import subprocess
 from typing import Tuple
+import tempfile
 import shutil
 
-# Optional redvid downloader for Reddit videos
+# Redvid downloader for Reddit videos
 try:
     from redvid import Downloader as RedvidDownloader
     REDVID_AVAILABLE = True
 except Exception:
     REDVID_AVAILABLE = False
+    logger.error("redvid not available - Reddit video downloads will fail")
 
 # Load environment variables
 load_dotenv()
@@ -369,152 +367,29 @@ class RedditToTelegramBot:
                                     parse_mode=None
                                 )
                         elif any(url_lower.endswith(ext) for ext in ['.mp4', '.webm', '.mov']) or 'v.redd.it' in url_lower:
-                            # Send as video: try to download and upload to Telegram (more reliable)
-                            video_path = None
-                            audio_path = None
-                            merged_path = None
-                            download_attempts = 4
-                            last_error = None
-
-                            # 1) Prefer redvid for v.redd.it to fetch video+audio automatically
+                            # Send as video using redvid for Reddit videos
                             if 'v.redd.it' in url_lower and REDVID_AVAILABLE:
-                                tmp_dir = tempfile.mkdtemp(prefix="redvid_")
                                 try:
-                                    # If imageio-ffmpeg exists, hint ffmpeg path to environment so redvid can use it
-                                    try:
-                                        import imageio_ffmpeg
-                                        os.environ.setdefault('FFMPEG_BINARY', imageio_ffmpeg.get_ffmpeg_exe())
-                                    except Exception:
-                                        pass
+                                    # Use redvid to download Reddit video with audio
+                                    tmp_dir = tempfile.mkdtemp(prefix="redvid_")
                                     rd = RedvidDownloader(max_q=True)
                                     rd.url = media_url
                                     rd.path = tmp_dir
-                                    # Silence redvid logs if possible
-                                    try:
-                                        rd.overwrite = True
-                                    except Exception:
-                                        pass
+                                    rd.overwrite = True
+                                    
+                                    # Download video
                                     await asyncio.to_thread(rd.download)
-                                    # Pick the largest mp4 in tmp_dir
-                                    candidates = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.lower().endswith('.mp4')]
-                                    if candidates:
-                                        candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
-                                        video_path = candidates[0]
-                                except BaseException as rederr:
-                                    logger.warning(f"redvid download failed: {rederr}")
-                                finally:
-                                    # Do not remove tmp_dir yet if video_path points inside it; we'll clean later
-                                    if not video_path:
-                                        try:
-                                            shutil.rmtree(tmp_dir, ignore_errors=True)
-                                        except Exception:
-                                            pass
-
-                            # 2) If redvid not used or failed, fallback to manual download + optional ffmpeg mux
-                            for attempt in range(1, download_attempts + 1):
-                                try:
-                                    if video_path:
-                                        break
-                                    def _download():
-                                        tmp_dir = tempfile.gettempdir()
-                                        ext = '.mp4'
-                                        path = os.path.join(tmp_dir, f"reddit_vid_{uuid.uuid4().hex}{ext}")
-                                        # Use browser-like headers; some CDNs block default urllib UA or missing referer
-                                        req = urllib.request.Request(media_url, headers={
-                                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-                                            'Referer': 'https://www.reddit.com/',
-                                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                                            'Accept-Language': 'en-US,en;q=0.9'
-                                        })
-                                        with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as f:
-                                            f.write(r.read())
-                                        return path
-                                    video_path = await asyncio.to_thread(_download)
-                                    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-                                        break
-                                except Exception as de:
-                                    last_error = de
-                                    logger.warning(f"Video download attempt {attempt}/{download_attempts} failed: {de}")
-                                    await asyncio.sleep(2 * attempt)
-
-                            # Try to also download audio for v.redd.it (DASH audio)
-                            if 'v.redd.it' in url_lower:
-                                try:
-                                    # Derive audio URL from fallback/video URL pattern
-                                    # Examples: .../DASH_720.mp4 -> .../DASH_audio.mp4
-                                    # Strip query params for derivation, then re-attach if needed
-                                    base_no_q = media_url.split('?')[0]
-                                    audio_candidate = re.sub(r"DASH_[^/.]+\.mp4$", "DASH_audio.mp4", base_no_q)
-                                    if audio_candidate != base_no_q:
-                                        def _download_audio():
-                                            tmp_dir = tempfile.gettempdir()
-                                            path = os.path.join(tmp_dir, f"reddit_aud_{uuid.uuid4().hex}.mp4")
-                                            req = urllib.request.Request(audio_candidate, headers={
-                                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-                                                'Referer': 'https://www.reddit.com/',
-                                                'Accept': '*/*',
-                                                'Accept-Language': 'en-US,en;q=0.9'
-                                            })
-                                            with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as f:
-                                                f.write(r.read())
-                                            return path
-                                        audio_path = await asyncio.to_thread(_download_audio)
-                                        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-                                            audio_path = None
-                                except Exception as ae:
-                                    logger.warning(f"Audio download failed: {ae}")
-
-                            if video_path and os.path.exists(video_path):
-                                try:
-                                    # If we have audio too, try to mux with ffmpeg
-                                    if audio_path and os.path.exists(audio_path):
-                                        try:
-                                            merged_path = os.path.join(tempfile.gettempdir(), f"reddit_mux_{uuid.uuid4().hex}.mp4")
-                                            ffmpeg_path = None
-                                            try:
-                                                import imageio_ffmpeg
-                                                ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-                                            except Exception:
-                                                ffmpeg_path = 'ffmpeg'  # hope it's in PATH
-                                            # Try stream copy merge first (fast)
-                                            cmd = [ffmpeg_path, '-y', '-i', video_path, '-i', audio_path, '-c', 'copy', '-shortest', merged_path]
-                                            proc = await asyncio.to_thread(lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
-                                            if proc.returncode != 0 or not (os.path.exists(merged_path) and os.path.getsize(merged_path) > 0):
-                                                # Fallback: re-encode audio to AAC, copy video
-                                                logger.warning("ffmpeg copy mux failed; retrying with AAC re-encode for audio")
-                                                cmd = [ffmpeg_path, '-y', '-i', video_path, '-i', audio_path,
-                                                       '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', merged_path]
-                                                proc = await asyncio.to_thread(lambda: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
-
-                                            if proc.returncode == 0 and os.path.exists(merged_path) and os.path.getsize(merged_path) > 0:
-                                                # Use merged file
-                                                with open(merged_path, 'rb') as f:
-                                                    try:
-                                                        await self.telegram_bot.send_video(
-                                                            chat_id=TELEGRAM_CHAT_ID,
-                                                            video=f,
-                                                            caption=message,
-                                                            parse_mode='Markdown'
-                                                        )
-                                                    except TelegramError as te:
-                                                        logger.warning(f"Video (muxed) caption Markdown failed, retrying without parse_mode: {te}")
-                                                        await self.telegram_bot.send_video(
-                                                            chat_id=TELEGRAM_CHAT_ID,
-                                                            video=f,
-                                                            caption=message,
-                                                            parse_mode=None
-                                                        )
-                                                caption_attached = True
-                                            else:
-                                                logger.warning("ffmpeg mux failed; sending video-only")
-                                        except Exception as me:
-                                            logger.warning(f"ffmpeg merge error: {me}")
-
-                                    # If no merged file was sent, send the video-only file
-                                    if not caption_attached:
+                                    
+                                    # Find downloaded video file
+                                    video_files = [f for f in os.listdir(tmp_dir) if f.lower().endswith('.mp4')]
+                                    if video_files:
+                                        # Use the largest file (best quality)
+                                        video_files.sort(key=lambda f: os.path.getsize(os.path.join(tmp_dir, f)), reverse=True)
+                                        video_path = os.path.join(tmp_dir, video_files[0])
+                                        
+                                        # Send video to Telegram
                                         with open(video_path, 'rb') as f:
                                             try:
-                                                # Always include caption for video to avoid textless video
                                                 await self.telegram_bot.send_video(
                                                     chat_id=TELEGRAM_CHAT_ID,
                                                     video=f,
@@ -529,30 +404,33 @@ class RedditToTelegramBot:
                                                     caption=message,
                                                     parse_mode=None
                                                 )
-                                            # Mark that we already sent caption with the video
                                         caption_attached = True
-                                        # Remove non-fallback v.redd.it URLs to prevent duplicates
-                                        media_urls = [u for u in media_urls if 'v.redd.it' not in u.lower() or 'fallback_url' in u.lower()]
-                                        # We successfully sent the video; stop processing other media to avoid duplicates
+                                        
+                                        # Clean up
+                                        try:
+                                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                                        except Exception:
+                                            pass
                                         break
-                                finally:
+                                    else:
+                                        logger.warning("No video files found after redvid download")
+                                        # Clean up empty directory
+                                        try:
+                                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                                        except Exception:
+                                            pass
+                                        
+                                except Exception as e:
+                                    logger.warning(f"redvid download failed: {e}")
+                                    # Clean up on error
                                     try:
-                                        os.remove(video_path)
+                                        shutil.rmtree(tmp_dir, ignore_errors=True)
                                     except Exception:
                                         pass
-                                    if audio_path:
-                                        try:
-                                            os.remove(audio_path)
-                                        except Exception:
-                                            pass
-                                    if merged_path:
-                                        try:
-                                            os.remove(merged_path)
-                                        except Exception:
-                                            pass
-                            else:
-                                # Could not download after retries: send title/content only, and include video source URL
-                                fallback_text = message + ("\n\nVideo: " + media_url if media_url else "")
+                            
+                            # If redvid failed or not available, send fallback message with URL
+                            if not caption_attached:
+                                fallback_text = message + f"\n\nVideo: {media_url}"
                                 try:
                                     await self.telegram_bot.send_message(
                                         chat_id=TELEGRAM_CHAT_ID,
@@ -568,7 +446,6 @@ class RedditToTelegramBot:
                                         parse_mode=None,
                                         disable_web_page_preview=False
                                     )
-                                # Ensure only a single Telegram message is sent in this failure scenario
                                 sent_fallback = True
                                 break
                         else:
