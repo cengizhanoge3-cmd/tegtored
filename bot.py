@@ -504,6 +504,11 @@ async def ping():
     """Simple ping endpoint for uptime checks"""
     return {"status": "alive"}
 
+@app.head("/ping")
+async def ping_head():
+    """HEAD support for /ping (returns 200 without body)"""
+    return PlainTextResponse(status_code=200, content="")
+
 @app.get("/health")
 async def health_check():
     """Health check for Render.com"""
@@ -514,6 +519,11 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "processed_posts": len(bot_instance.processed_posts) if bot_instance else 0
     }
+
+@app.head("/health")
+async def health_head():
+    """HEAD support for /health (returns 200 without body)"""
+    return PlainTextResponse(status_code=200, content="")
 
 @app.get("/stats")
 async def get_stats():
