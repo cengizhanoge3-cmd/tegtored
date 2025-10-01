@@ -255,8 +255,8 @@ class RedditToTelegramBot:
         """Format Reddit post for Telegram. Returns (message, media_urls)"""
         title = submission.title
         
-        # Start with just the title
-        message = f"🎮 **{title}**\n\n"
+        # Start with just the title (no emoji)
+        message = f"**{title}**\n\n"
         
         # Get post content
         content = ""
@@ -301,13 +301,7 @@ class RedditToTelegramBot:
                             img_url = img_url.split('?')[0]  # Remove query parameters
                             media_urls.append(img_url)
         
-        # Add source link at the end (smaller, less prominent)
-        # Always point to the Reddit post, not the media URL
-        try:
-            reddit_link = f"https://reddit.com{submission.permalink}"
-        except Exception:
-            reddit_link = submission.url
-        message += f"🔗 [Kaynak]({reddit_link})"
+        # No source link appended
         
         return message, media_urls
     
@@ -327,28 +321,55 @@ class RedditToTelegramBot:
                         
                         if any(url_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
                             # Send as photo
-                            await self.telegram_bot.send_photo(
-                                chat_id=TELEGRAM_CHAT_ID,
-                                photo=media_url,
-                                caption=message if len(media_urls) == 1 else None,
-                                parse_mode='Markdown'
-                            )
+                            try:
+                                await self.telegram_bot.send_photo(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    photo=media_url,
+                                    caption=message if len(media_urls) == 1 else None,
+                                    parse_mode='Markdown'
+                                )
+                            except TelegramError as te:
+                                logger.warning(f"Photo caption Markdown failed, retrying without parse_mode: {te}")
+                                await self.telegram_bot.send_photo(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    photo=media_url,
+                                    caption=message if len(media_urls) == 1 else None,
+                                    parse_mode=None
+                                )
                         elif any(url_lower.endswith(ext) for ext in ['.mp4', '.webm', '.mov']) or 'v.redd.it' in url_lower:
                             # Send as video
-                            await self.telegram_bot.send_video(
-                                chat_id=TELEGRAM_CHAT_ID,
-                                video=media_url,
-                                caption=message if len(media_urls) == 1 else None,
-                                parse_mode='Markdown'
-                            )
+                            try:
+                                await self.telegram_bot.send_video(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    video=media_url,
+                                    caption=message if len(media_urls) == 1 else None,
+                                    parse_mode='Markdown'
+                                )
+                            except TelegramError as te:
+                                logger.warning(f"Video caption Markdown failed, retrying without parse_mode: {te}")
+                                await self.telegram_bot.send_video(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    video=media_url,
+                                    caption=message if len(media_urls) == 1 else None,
+                                    parse_mode=None
+                                )
                         else:
                             # Send as document for other formats
-                            await self.telegram_bot.send_document(
-                                chat_id=TELEGRAM_CHAT_ID,
-                                document=media_url,
-                                caption=message if len(media_urls) == 1 else None,
-                                parse_mode='Markdown'
-                            )
+                            try:
+                                await self.telegram_bot.send_document(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    document=media_url,
+                                    caption=message if len(media_urls) == 1 else None,
+                                    parse_mode='Markdown'
+                                )
+                            except TelegramError as te:
+                                logger.warning(f"Document caption Markdown failed, retrying without parse_mode: {te}")
+                                await self.telegram_bot.send_document(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    document=media_url,
+                                    caption=message if len(media_urls) == 1 else None,
+                                    parse_mode=None
+                                )
                         
                         await asyncio.sleep(1)  # Rate limiting between media
                         
@@ -358,12 +379,25 @@ class RedditToTelegramBot:
                 
                 # If multiple media items, send text separately
                 if len(media_urls) > 1:
-                    await self.telegram_bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=message,
-                        parse_mode='Markdown',
-                        disable_web_page_preview=True
-                    )
+                    try:
+                        await self.telegram_bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=message,
+                            parse_mode='Markdown',
+                            disable_web_page_preview=True
+                        )
+                    except TelegramError as te:
+                        logger.warning(f"Text Markdown failed, retrying without parse_mode: {te}")
+                        try:
+                            await self.telegram_bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=message,
+                                parse_mode=None,
+                                disable_web_page_preview=True
+                            )
+                        except TelegramError as te2:
+                            logger.warning(f"Text retry without parse_mode failed: {te2}")
+                            return False
             else:
                 # No media, send text only
                 max_length = 4096
@@ -371,20 +405,45 @@ class RedditToTelegramBot:
                     # Send in chunks
                     for i in range(0, len(message), max_length):
                         chunk = message[i:i + max_length]
+                        try:
+                            await self.telegram_bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=chunk,
+                                parse_mode='Markdown',
+                                disable_web_page_preview=True
+                            )
+                        except TelegramError as te:
+                            logger.warning(f"Chunk Markdown failed, retrying without parse_mode: {te}")
+                            try:
+                                await self.telegram_bot.send_message(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    text=chunk,
+                                    parse_mode=None,
+                                    disable_web_page_preview=True
+                                )
+                            except TelegramError as te2:
+                                logger.warning(f"Chunk retry without parse_mode failed: {te2}")
+                                return False
+                else:
+                    try:
                         await self.telegram_bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
-                            text=chunk,
+                            text=message,
                             parse_mode='Markdown',
                             disable_web_page_preview=True
                         )
-                        await asyncio.sleep(1)  # Rate limiting
-                else:
-                    await self.telegram_bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=message,
-                        parse_mode='Markdown',
-                        disable_web_page_preview=True
-                    )
+                    except TelegramError as te:
+                        logger.warning(f"Text Markdown failed, retrying without parse_mode: {te}")
+                        try:
+                            await self.telegram_bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=message,
+                                parse_mode=None,
+                                disable_web_page_preview=True
+                            )
+                        except TelegramError as te2:
+                            logger.warning(f"Text retry without parse_mode failed: {te2}")
+                            return False
             
             logger.info("Message sent to Telegram successfully")
             return True
@@ -693,7 +752,8 @@ def main():
     # Validate required environment variables
     required_vars = [
         "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", 
-        "REDDIT_USERNAME", "REDDIT_PASSWORD", "TELEGRAM_CHAT_ID"
+        "REDDIT_USERNAME", "REDDIT_PASSWORD", 
+        "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"
     ]
     
     missing_vars = [var for var in required_vars if not os.getenv(var)]
