@@ -9,6 +9,7 @@ import threading
 
 # Reddit API
 import praw
+import prawcore
 from praw.models import Submission
 
 # Telegram Bot API
@@ -1057,10 +1058,43 @@ async def process_once(request: Request):
         if not url:
             return {"status": "error", "message": "'url' is required. Send JSON {\"url\": \"...\"} or use ?url=..."}
 
-        # Fetch submission directly by URL
-        submission = bot_instance.reddit.submission(url=url)
-        # Ensure data is loaded
-        submission._fetch()
+        # Fetch submission directly by URL with rate-limit handling (auto-retry once)
+        async def _fetch_submission_once():
+            sub = bot_instance.reddit.submission(url=url)
+            sub._fetch()
+            return sub
+
+        try:
+            submission = await _fetch_submission_once()
+        except prawcore.exceptions.TooManyRequests as tmr:
+            retry_after = getattr(tmr, 'sleep_time', None)
+            # Auto-wait and retry once if retry_after is short enough
+            if isinstance(retry_after, (int, float)) and retry_after <= 60:
+                logger.warning(f"429 from Reddit. Auto-waiting {retry_after}s then retrying once...")
+                await asyncio.sleep(retry_after)
+                try:
+                    submission = await _fetch_submission_once()
+                except Exception:
+                    return {
+                        "status": "error",
+                        "message": "Reddit rate limited this request (429)",
+                        "retry_after": retry_after
+                    }
+            else:
+                return {
+                    "status": "error",
+                    "message": "Reddit rate limited this request (429)",
+                    "retry_after": retry_after
+                }
+        except prawcore.exceptions.ResponseException as rexc:
+            status = getattr(rexc, 'response', None).status_code if getattr(rexc, 'response', None) else None
+            if status == 429:
+                return {
+                    "status": "error",
+                    "message": "Reddit rate limited this request (429)",
+                    "retry_after": None
+                }
+            raise
 
         # Format and send using existing logic (with robust media handling)
         message, media_urls, reddit_post_url = bot_instance.format_post_for_telegram(submission)
