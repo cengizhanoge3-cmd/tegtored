@@ -367,28 +367,31 @@ class RedditToTelegramBot:
                                     parse_mode=None
                                 )
                         elif any(url_lower.endswith(ext) for ext in ['.mp4', '.webm', '.mov']) or 'v.redd.it' in url_lower:
-                            # Send as video using redvid for Reddit videos
+                            # Handle video content
+                            video_sent = False
+                            
+                            # Try redvid for Reddit videos
                             if 'v.redd.it' in url_lower and REDVID_AVAILABLE:
                                 try:
-                                    # Use redvid to download Reddit video with audio
-                                    tmp_dir = tempfile.mkdtemp(prefix="redvid_")
-                                    rd = RedvidDownloader(max_q=True)
-                                    rd.url = media_url
-                                    rd.path = tmp_dir
-                                    rd.overwrite = True
+                                    logger.info(f"Attempting redvid download for: {media_url}")
                                     
-                                    # Download video
-                                    await asyncio.to_thread(rd.download)
+                                    # Create downloader with proper settings
+                                    rd = RedvidDownloader(
+                                        url=media_url,
+                                        max_q=True,
+                                        overwrite=True,
+                                        log=False  # Disable redvid logging to avoid console spam
+                                    )
                                     
-                                    # Find downloaded video file
-                                    video_files = [f for f in os.listdir(tmp_dir) if f.lower().endswith('.mp4')]
-                                    if video_files:
-                                        # Use the largest file (best quality)
-                                        video_files.sort(key=lambda f: os.path.getsize(os.path.join(tmp_dir, f)), reverse=True)
-                                        video_path = os.path.join(tmp_dir, video_files[0])
+                                    # Download video - returns file path or error code
+                                    result = await asyncio.to_thread(rd.download)
+                                    
+                                    if isinstance(result, str) and os.path.exists(result):
+                                        # Success - result is the file path
+                                        logger.info(f"Successfully downloaded video: {result} ({os.path.getsize(result)} bytes)")
                                         
                                         # Send video to Telegram
-                                        with open(video_path, 'rb') as f:
+                                        with open(result, 'rb') as f:
                                             try:
                                                 await self.telegram_bot.send_video(
                                                     chat_id=TELEGRAM_CHAT_ID,
@@ -404,33 +407,74 @@ class RedditToTelegramBot:
                                                     caption=message,
                                                     parse_mode=None
                                                 )
+                                        video_sent = True
                                         caption_attached = True
+                                        logger.info("Video sent successfully to Telegram")
                                         
-                                        # Clean up
+                                        # Clean up downloaded file
                                         try:
-                                            shutil.rmtree(tmp_dir, ignore_errors=True)
+                                            os.remove(result)
                                         except Exception:
                                             pass
-                                        break
                                     else:
-                                        logger.warning("No video files found after redvid download")
-                                        # Clean up empty directory
-                                        try:
-                                            shutil.rmtree(tmp_dir, ignore_errors=True)
-                                        except Exception:
-                                            pass
+                                        # Handle error codes
+                                        if result == 0:
+                                            logger.warning("Video size exceeds maximum limit")
+                                        elif result == 1:
+                                            logger.warning("Video duration exceeds maximum limit")
+                                        elif result == 2:
+                                            logger.warning("Video file already exists")
+                                        else:
+                                            logger.warning(f"Unexpected redvid result: {result}")
                                         
                                 except Exception as e:
-                                    logger.warning(f"redvid download failed: {e}")
-                                    # Clean up on error
-                                    try:
-                                        shutil.rmtree(tmp_dir, ignore_errors=True)
-                                    except Exception:
-                                        pass
+                                    logger.warning(f"redvid download failed for {media_url}: {e}")
+                                    # Check if it's the "No video in this post" error
+                                    if "No video in this post" in str(e):
+                                        logger.info("Post doesn't contain a downloadable video, will try direct URL")
+                                    elif "Incorrect URL format" in str(e):
+                                        logger.info("URL format not supported by redvid, will try direct URL")
+                                
+                                # Clean up any temp directories redvid might have left
+                                try:
+                                    rd.clean_temp()
+                                except Exception:
+                                    pass
                             
-                            # If redvid failed or not available, send fallback message with URL
-                            if not caption_attached:
-                                fallback_text = message + f"\n\nVideo: {media_url}"
+                            # If redvid failed or not available, try sending video URL directly
+                            if not video_sent:
+                                try:
+                                    logger.info(f"Trying to send video URL directly: {media_url}")
+                                    await self.telegram_bot.send_video(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        video=media_url,
+                                        caption=message,
+                                        parse_mode='Markdown'
+                                    )
+                                    video_sent = True
+                                    caption_attached = True
+                                    logger.info("Video URL sent successfully to Telegram")
+                                except TelegramError as te:
+                                    logger.warning(f"Direct video URL failed: {te}")
+                                    try:
+                                        await self.telegram_bot.send_video(
+                                            chat_id=TELEGRAM_CHAT_ID,
+                                            video=media_url,
+                                            caption=message,
+                                            parse_mode=None
+                                        )
+                                        video_sent = True
+                                        caption_attached = True
+                                        logger.info("Video URL sent successfully (without Markdown)")
+                                    except TelegramError as te2:
+                                        logger.warning(f"Direct video URL failed even without Markdown: {te2}")
+                                except Exception as e:
+                                    logger.warning(f"Direct video URL failed: {e}")
+                            
+                            # Final fallback: send as text message with video link
+                            if not video_sent:
+                                logger.info("All video methods failed, sending as text with link")
+                                fallback_text = message + f"\n\n🎥 Video: {media_url}"
                                 try:
                                     await self.telegram_bot.send_message(
                                         chat_id=TELEGRAM_CHAT_ID,
@@ -447,6 +491,9 @@ class RedditToTelegramBot:
                                         disable_web_page_preview=False
                                     )
                                 sent_fallback = True
+                                logger.info("Fallback message sent successfully")
+                            
+                            if video_sent:
                                 break
                         else:
                             # Send as document for other formats
